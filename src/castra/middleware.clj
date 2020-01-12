@@ -36,11 +36,13 @@
   (when-not (get-in *request* [:headers "x-castra-csrf"])
     (throw (ex-info "Invalid CSRF token" {}))))
 
-(defn- do-rpc [vars [f & args]]
+(defn- do-rpc [vars [f & args] ctx]
   (let [bad!  #(throw (ex-info "RPC endpoint not found" {:endpoint (symbol f)}))
         fun   (or (resolve (symbol f)) (bad!))]
     (when-not (contains? vars fun) (bad!))
-    (apply fun args)))
+    (if ctx
+      (apply fun ctx args)
+      (apply fun args))))
 
 (defn- select-vars [nsname & {:keys [only exclude]}]
   (let [to-var    #(resolve (symbol (str nsname) (str %)))
@@ -108,7 +110,7 @@
                 (assoc-in [:headers "X-Castra-Session"] data'))))))))
 
 (defn wrap-castra [handler & [opts & more :as namespaces]]
-  (let [{:keys [body-keys state-fn] :as opts} (when (map? opts) opts)
+  (let [{:keys [ctx body-keys state-fn] :as opts} (when (map? opts) opts)
         nses (if opts more namespaces)
         head {"X-Castra-Tunnel" "transit"}
         seq* #(or (try (seq %) (catch Throwable e)) [%])
@@ -122,7 +124,7 @@
                   *session*       (atom (:session req))
                   *validate-only* (= "true" (get-in req [:headers "x-castra-validate-only"]))]
           (let [h (headers req head {"Content-Type" "application/json;charset=utf-8"})
-                f #(do (csrf!) (do-rpc (vars) (expression body-keys req)))
+                f #(do (csrf!) (do-rpc (vars) (expression body-keys req) ctx))
                 d (try (response body-keys req {:result (f) :state (when state-fn (state-fn))})
                        (catch Throwable e
                          (response body-keys req {:error (ex->clj e)})))]
