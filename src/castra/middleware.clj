@@ -1,13 +1,14 @@
 (ns castra.middleware
   (:require
-    [clojure.java.shell             :as sh]
-    [cognitect.transit              :as t]
+    [clojure.java.shell :as sh]
+    [io.pedestal.log :as log]
+    [cognitect.transit :as t]
     [ring.middleware.session.cookie :as c]
-    [clojure.string                 :as string]
-    [ring.util.request              :as q :refer [body-string]]
-    [clojure.set                    :as s :refer [intersection difference]]
-    [castra.core                    :as r :refer [ex ex? dfl-ex *pre* *request* *session* *validate-only*]]
-    [clojure.stacktrace             :as u :refer [print-cause-trace print-stack-trace]])
+    [clojure.string :as string]
+    [ring.util.request :as q :refer [body-string]]
+    [clojure.set :as s :refer [intersection difference]]
+    [castra.core :as r :refer [ex ex? dfl-ex *pre* *request* *session* *validate-only*]]
+    [clojure.stacktrace :as u :refer [print-cause-trace print-stack-trace]])
   (:import
     [java.io File]
     [java.util.regex Pattern]
@@ -37,20 +38,20 @@
     (throw (ex-info "Invalid CSRF token" {}))))
 
 (defn- do-rpc [vars [f & args] ctx]
-  (let [bad!  #(throw (ex-info "RPC endpoint not found" {:endpoint (symbol f)}))
-        fun   (or (resolve (symbol f)) (bad!))]
+  (let [bad! #(throw (ex-info "RPC endpoint not found" {:endpoint (symbol f)}))
+        fun (or (resolve (symbol f)) (bad!))]
     (when-not (contains? vars fun) (bad!))
     (if ctx
       (apply fun ctx args)
       (apply fun args))))
 
 (defn- select-vars [nsname & {:keys [only exclude]}]
-  (let [to-var    #(resolve (symbol (str nsname) (str %)))
-        to-vars   #(->> % (map to-var) (keep identity) set)
-        var-pubs  #(do (require %) (vals (ns-publics %)))
-        vars      (->> nsname var-pubs set)
-        only      (if (seq only) (to-vars only) vars)
-        exclude   (if (seq exclude) (to-vars exclude) #{})]
+  (let [to-var #(resolve (symbol (str nsname) (str %)))
+        to-vars #(->> % (map to-var) (keep identity) set)
+        var-pubs #(do (require %) (vals (ns-publics %)))
+        vars (->> nsname var-pubs set)
+        only (if (seq only) (to-vars only) vars)
+        exclude (if (seq exclude) (to-vars exclude) #{})]
     (-> vars (intersection only) (difference exclude))))
 
 (def clj->json
@@ -81,9 +82,9 @@
        (= :post (:request-method req))))
 
 (defn wrap-castra-session [handler ^String key & [{:keys [timeout]}]]
-  (let [key     (.getBytes key)
-        seal    (var-get #'ring.middleware.session.cookie/seal)
-        unseal  (var-get #'ring.middleware.session.cookie/unseal)
+  (let [key (.getBytes key)
+        seal (var-get #'ring.middleware.session.cookie/seal)
+        unseal (var-get #'ring.middleware.session.cookie/unseal)
         encrypt #(try (seal key %) (catch Throwable _))
         decrypt #(try (unseal key %) (catch Throwable _))]
     (assert (and (= (type (byte-array 0)) (type key))
@@ -92,18 +93,18 @@
     (fn [req]
       (if-not (castra-req? req)
         (handler req)
-        (let [now    (System/currentTimeMillis)
-              sess?  (contains? (:headers req) "x-castra-session")
-              raw    (get-in req [:headers "x-castra-session"])
-              data   (when raw (decrypt raw))
+        (let [now (System/currentTimeMillis)
+              sess? (contains? (:headers req) "x-castra-session")
+              raw (get-in req [:headers "x-castra-session"])
+              data (when raw (decrypt raw))
               expire (+ (or (:time data) now) (or timeout default-timeout))
-              sess   (:data (when (and data (< now expire)) data))
-              req'   (if-not sess? req (assoc req :session sess))
-              resp   (handler req')
-              data'  (if (and sess? (not (:session resp)))
-                       "DELETE"
-                       (when-let [s (:session resp)]
-                         (encrypt {:time now :data s})))]
+              sess (:data (when (and data (< now expire)) data))
+              req' (if-not sess? req (assoc req :session sess))
+              resp (handler req')
+              data' (if (and sess? (not (:session resp)))
+                      "DELETE"
+                      (when-let [s (:session resp)]
+                        (encrypt {:time now :data s})))]
           (if-not data'
             resp
             (-> (dissoc resp :session)
@@ -115,18 +116,21 @@
         head {"X-Castra-Tunnel" "transit"}
         seq* #(or (try (seq %) (catch Throwable e)) [%])
         vars (fn [] (->> nses (map seq*) (mapcat #(apply select-vars %)) set))]
+    (log/info :castra {:wrapped nses :vars vars} :message "Wrapped namespaces with Castra")
     (fn [req]
       (if-not (castra-req? req)
         (handler req)
-        (binding [*print-meta*    true
-                  *pre*           true
-                  *request*       req
-                  *session*       (atom (:session req))
+        (binding [*print-meta* true
+                  *pre* true
+                  *request* req
+                  *session* (atom (:session req))
                   *validate-only* (= "true" (get-in req [:headers "x-castra-validate-only"]))]
+          (log/debug :validate-only *validate-only* :message "Handling Castra request")
           (let [h (headers req head {"Content-Type" "application/json;charset=utf-8"})
                 f #(do (csrf!) (do-rpc (vars) (expression body-keys req) ctx))
                 d (try (response body-keys req {:result (f) :state (when state-fn (state-fn))})
                        (catch Throwable e
+                         (log/error :exception e :message "Castra request failed")
                          (response body-keys req {:error (ex->clj e)})))]
             {:status 200, :headers h, :body d, :session @*session*}))))))
 
@@ -156,7 +160,7 @@ page.open(url, function(status) {
     (fn [url]
       (let [{:keys [exit err out]} (sh/sh "phantomjs" js-path url)]
         (or (and (zero? exit) out)
-          (throw (Exception. (format "phantomjs: %s (%d)" err exit))))))))
+            (throw (Exception. (format "phantomjs: %s (%d)" err exit))))))))
 
 (defn wrap-escaped-fragment
   "Middleware to detect Google's `_escaped_fragment_` AJAX crawling requests [1]
@@ -172,9 +176,9 @@ page.open(url, function(status) {
   [handler scrape]
   (fn [{{frag "_escaped_fragment_"} :params
         {:strs [host]}              :headers
-        :keys [scheme uri request-method] :as req}]
+        :keys                       [scheme uri request-method] :as req}]
     (let [{:keys [status] :as resp} (handler req)
-          err   {:status 500 :body "Server Error"}
-          url   (str (name scheme) "://" host uri "#!" frag)
+          err {:status 500 :body "Server Error"}
+          url (str (name scheme) "://" host uri "#!" frag)
           resp? (not (and frag (= [200 :get] [status request-method])))]
       (if resp? resp (try (assoc resp :body (scrape url)) (catch Throwable _ err))))))
